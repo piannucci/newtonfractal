@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 #
 # Newton's algorithm on a function f:
 #   next(x) = x - f(x) / f'(x)
@@ -23,19 +24,14 @@
 # necessary for good convergence anyhow.
 #
 
-import math
-import cmath
 import time
 import numpy as np
 import imageio
-
-log = math.log
-exp = math.exp
-pi = math.pi
-cos = math.cos
-sin = math.sin
+import profile
 
 default_epsilon = 0.00001
+
+np.seterr(divide='ignore', invalid='ignore')
 
 class Region:
     def __init__(self, center, width, px_wide, px_tall):
@@ -43,9 +39,6 @@ class Region:
         self.width = width
         self.A = px_wide
         self.B = px_tall
-
-    def pixels(self):
-        return [(i, j) for i in range(self.A) for j in range(self.B)]
 
     def dx(self):
         return self.width / self.A
@@ -59,23 +52,15 @@ class Region:
 
 class Poly:
     def __init__(self, roots):
-        self.roots = list(roots)
+        self.roots = np.array(list(roots))
         self.degree = len(self.roots)
 
     def eval(self, z):
-        result = 1
-        for r in self.roots:
-            result *= (z - r)
-        return result
+        return (z[...,None] - self.roots).prod(-1)
 
     # compute f(z) / f'(z)
     def eval_NR(self, z):
-        result = 0
-        for r in self.roots:
-            result += 1 / (z - r)
-        if result == 0:
-            return float('nan') * 1j
-        return 1 / result
+        return 1 / (1 / (z[...,None] - self.roots)).sum(-1)
 
     # compute f''(r_i) / f'(r_i) where r_i is the i-th root
     def compute_ddf_df(self, i):
@@ -98,56 +83,65 @@ class Poly:
         return (ddf / df)
 
 class NF:
-    def __init__(self, func, max_steps = None, epsilon = None):
+    def __init__(self, func, max_steps = 200, epsilon = default_epsilon):
         self.func = func
 
-        if max_steps is None:
-            self.max_steps = 200
-        else:
-            self.max_steps = max_steps
+        self.max_steps = max_steps
 
-        if epsilon is None:
-            epsilon = default_epsilon
+        self.targets = np.array(list(func.roots))
+        self.target_c = abs(np.array([func.compute_ddf_df(i) for i in range(func.degree)]))
 
-        self.targets = list(func.roots)
-        self.target_c = [abs(func.compute_ddf_df(i)) for i in range(func.degree)]
-
-        for c in self.target_c:
-            if epsilon * c > 0.01:
-                epsilon = 0.01 / c
-        self.epsilon = epsilon
+        self.epsilon = min(epsilon, .01/self.target_c.max())
 
         self.total_queries = 0
         self.total_steps = 0
         self.most_steps = 0
         self.num_failed = 0
 
-
+    # clobbers input
     def converge(self, z):
-        self.total_queries += 1
-        go = self.func.eval_NR
-        epsilon = self.epsilon
+        self.total_queries += z.size
+        z_shape = z.shape
+        z = z.flatten()
+        idx = np.arange(z.size, dtype=int)
+        fsteps = np.full(z.size, -1, dtype=float)
+        target = np.full(z.size, -1, dtype=int)
 
-        steps = 0
-        while steps < self.max_steps:
-            if cmath.isnan(z):
+        iteration = 0
+        while iteration < self.max_steps:
+            if idx.size == 0:
                 break
 
-            for i, t in enumerate(self.targets):
-                if abs(z - t) < epsilon:
-                    c = self.target_c[i]
-                    fsteps = steps - log(log(c * abs(z - t)) / log(c * epsilon)) / log(2)
+            # exclude NaNs
+            dead_pixels = np.isnan(z[idx])
+            idx = idx[~dead_pixels]
 
-                    self.total_steps += steps
-                    self.most_steps = max(self.most_steps, steps)
-                    return (i, fsteps)
+            # match iterand against targets
+            err = abs(z[idx,None] - self.targets)
+            converged_points, converged_to = (err < self.epsilon).nonzero()
 
-            z = z - go(z)
-            steps += 1
+            # process converged points
+            if len(converged_points):
+                i = converged_to
+                j = idx[converged_points]
+                c = self.target_c[i]
+                err = err[converged_points, converged_to]
+                fsteps[j] = iteration - np.log2(np.log(c * err) /
+                                                np.log(c * self.epsilon))
+                target[j] = i
+                mask = np.ones(idx.size, dtype = bool)
+                mask[converged_points] = False
+                idx = idx[mask]
 
-        self.total_steps += steps
-        self.num_failed += 1
-        return None
+            self.total_steps += idx.size
+
+            z -= self.func.eval_NR(z)
+            iteration += 1
+
+        self.num_failed += (target==-1).sum()
+        self.most_steps = max(self.most_steps, iteration)
+
+        return (target.reshape(z_shape), fsteps.reshape(z_shape))
 
 class Colorizer:
     def __init__(self):
@@ -155,7 +149,7 @@ class Colorizer:
         red     = np.array([1, 0, 0], dtype = float)
         green   = np.array([0, 1, 0], dtype = float)
         blue    = np.array([0, 0, 1], dtype = float)
-        self.basecolors = [
+        self.basecolors = np.array([
                 blue,
                 green,
                 red,
@@ -163,111 +157,69 @@ class Colorizer:
                 red + blue,
                 red + green,
                 red + blue + green
-            ]
+            ])
         self.black = black
 
-    # Given non-negative integer, return a float from 0 to 1
+    # Given non-negative real, return a float from 0 to 1
     def intensity(self, steps):
-        return (0.1 * exp(-steps / 2) +
-                0.6 * exp(-steps / 5) +
-                0.2 * (1 / (1 + exp((steps - 15) / 5))) +
+        return (0.1 * np.exp(-steps / 2) +
+                0.6 * np.exp(-steps / 5) +
+                0.2 * (1 / (1 + np.exp((steps - 15) / 5))) +
                 0.1 * (20 / (20 + steps))
             )
 
     # returns numpy array of length 3 with values from 0 to 1
-    def color_converge(self, i, steps):
-        bc = self.basecolors[i % len(self.basecolors)]
-        return bc * self.intensity(steps)
-
-    def color_noconverge(self):
-        return self.black
-
     def color(self, result):
-        if result is None:
-            return self.color_noconverge()
-        else:
-            return self.color_converge(result[0], result[1])
-
-    def mean(self, colors):
-        s = 0
-        for c in colors:
-            s += c
-        return s * (1 / len(colors))
-
-    def quantize(self, colors):
-        x = colors * 256
-        x[x <= 0] = 0
-        x[x >= 255] = 255
-        return x.astype(dtype = np.uint8)
+        target, fsteps = result
+        output = self.basecolors[target % len(self.basecolors)] * self.intensity(fsteps)[...,None]
+        output[target==-1] = self.black 
+        return output
 
 # antialiased == 0 suppresses antialiasing
 def compute_image(nf, colorizer, region, antialiased = 3):
     A, B = region.A, region.B
-    out = np.zeros((A, B, 3), dtype = float)
 
     ll = region.lowerleft()
     dx = region.dx()
 
-    # -1 will be used for missing the target
-    target  = np.zeros((A, B), dtype = int)
-    steps   = np.zeros((A, B), dtype = float)
+    # compute center of pixel
+    z = ll + dx * (np.arange(A)[:,None] + 1j * np.arange(B)[None,:])
+    result = nf.converge(z)
 
-    # First, compute every pixel
-    for i, j in region.pixels():
-        # compute center of pixel
-        z = ll + dx * (i + 1j * j)
-        result = nf.converge(z)
-
-        if result is None:
-            target[i, j] = -1
-            steps[i, j] = 0
-        else:
-            target[i, j] = result[0]
-            steps[i, j] = result[1]
-
-        out[i, j, :] = colorizer.color(result)
+    out = colorizer.color(result)
 
     if antialiased >= 2:
-        aa = list(np.linspace(-1, 1, antialiased + 2)[1:-1])
+        aa = np.linspace(-1, 1, antialiased + 2)[1:-1] / 2
+        aa = (aa[:,None] + 1j*aa[None,:]).flatten()
 
         # Now, antialias the boundaries
+        target = result[0]
         boundary = np.zeros((A, B), dtype = bool)
-        boundary[1:, :]     |= np.not_equal(target[1:, :], target[:-1, :])
-        boundary[:-1, :]    |= np.not_equal(target[1:, :], target[:-1, :])
-        boundary[:, 1:]     |= np.not_equal(target[:, 1:], target[:, :-1])
-        boundary[:, :-1]    |= np.not_equal(target[:, 1:], target[:, :-1])
+        boundary[1:, :]  |= (target[1:, :] != target[:-1, :])
+        boundary[:-1, :] |= (target[1:, :] != target[:-1, :])
+        boundary[:, 1:]  |= (target[:, 1:] != target[:, :-1])
+        boundary[:, :-1] |= (target[:, 1:] != target[:, :-1])
 
-        for i, j in region.pixels():
-            if not boundary[i, j]:
-                continue
-            colors = []
-            for i_ in aa:
-                for j_ in aa:
-                    z = ll + dx * (i + i_ + 1j * (j + j_))
-                    result = nf.converge(z)
-                    colors.append(colorizer.color(result))
-            out[i, j, :] = colorizer.mean(colors)
+        i, j = boundary.nonzero()
+        z = ll + dx * (i[:,None] + 1j * j[:,None] + aa[None,:])
+        out[i,j] = colorizer.color(nf.converge(z)).mean(1)
 
-    return colorizer.quantize(out)
+    return np.clip((out * 256).astype(int), 0, 255).astype(np.uint8)
 
 def flip_data(data):
-    width, height, x = data.shape
-    assert (x == 3)
-
-    data = (np.transpose(data, (1, 0, 2)))[::-1, :, :]
-    assert (data.shape == (height, width, 3))
-
-    return data
+    return data.transpose(1,0,2)[::-1]
 
 def save_image(data, filename):
     imageio.imwrite(filename, flip_data(data))
 
-def picture(roots, region, filename = 'test.png'):
+def picture(roots, region, filename = 'test.png', antialiased = 3):
     func = Poly(roots)
     nf = NF(func, max_steps = 400)
 
     start = time.monotonic()
-    image = compute_image(nf, Colorizer(), region)
+    output = [None]
+    profile.runctx('output[0] = compute_image(nf, Colorizer(), region, antialiased)', globals(), locals())
+    image = output[0]
     elapsed = time.monotonic() - start
 
     save_image(image, filename)
@@ -318,41 +270,43 @@ def movie(roots_func, region, filename = 'test.mp4', fps = 20, seconds = 5, peri
     imageio.mimwrite(filename, images, fps = fps, quality = 10)
 
 def root_of_unity(n):
-    return cos(2 * pi / n) + 1j * sin(2 * pi / n)
+    return np.exp(1j * 2 * np.pi / n)
 
 if __name__ == "__main__":
-    # roots = [1, -0.5 + 1j * math.sqrt(3) / 2, -0.5 - 1j * math.sqrt(3) / 2]
-    # run(roots, 0, 4, 1440, 900, 'cubic.png')
-    # run(roots, 0, 4, 3 * 1440, 3 * 900, 'cubic3.png')
-
+    # roots = [1, -0.5 + 1j * 3**.5 / 2, -0.5 - 1j * 3**.5 / 2]
+    # picture(roots, Region(0, 4, 1440, 900), 'cubic.png')
+    # picture(roots, Region(0, 4, 3 * 1440, 3 * 900), 'cubic3.png')
 
     # roots = [1, 1.5, -1 + 1j, -1 -1j]
-    # run(roots, 0, 5, 1440, 900, 'p00.png')
+    # picture(roots, Region(0, 5, 1440, 900), 'p00.png')
 
     # w7 = root_of_unity(7)
     # roots = [1, w7, w7 ** 2, w7 ** 3, w7 ** 4, w7 ** 5, w7 ** 6]
-    # run(roots, 0, 4, 1440, 900, 'septic.png')
+    # picture(roots, Region(0, 4, 1440, 900), 'septic.png')
 
     # w5 = root_of_unity(5)
     # roots = [1, w5, w5 ** 2, w5 ** 3, w5 ** 4]
-    # run(roots, 0, 4, 1440, 900, 'quintic.png')
+    # picture(roots, Region(0, 4, 1440, 900), 'quintic.png')
 
     # roots = [2, -2, 1j, -1j]
-    # run(roots, 0, 8, 1440, 900, 'p01.png')
+    # picture(roots, Region(0, 8, 1440, 900), 'p01.png')
 
     # roots = [-1, 1, -1 + 0.3j]
-    # run(roots, 0, 4, 1440, 900, 'p02.png')
+    # picture(roots, Region(0, 4, 1440, 900), 'p02.png')
 
     # roots = [2, -2, 0.5j, -0.5j]
-    # run(roots, 0, 8, 1440, 900, 'p03.png')
+    # picture(roots, Region(0, 8, 1440, 900), 'p03.png')
 
     # roots = [2, -2, 0.2j, -0.2j]
-    # run(roots, 0, 8, 1440, 900, 'p04.png')
+    # picture(roots, Region(0, 8, 1440, 900), 'p04.png')
 
-    # roots = [2, -2, 0.02j, -0.02j]
-    # run(roots, 0, 8, 1440, 900, 'p05.png')
+    #roots = [2.3, -2.3, 1.j, -1.j]
+    #picture(roots, Region(0, 8, 2*1440, 2*900), filename='p05-retina.png')
 
-    roots = (lambda t : [cos(t + pi / 2) + 1j * sin(2 * t + pi),
-            cos(t) + 1j * sin(t),
-            cos(t + pi) + 1j * sin(t + pi)])
-    movie(roots, Region(0, 4, 800, 800), 'm00.mp4', 30, 10, 2 * pi, 3)
+    roots = [2, -2, 0.02j, -0.02j]
+    picture(roots, Region(0, 8, 1440, 900), filename='p05.png')
+
+    #roots = (lambda t : [np.cos(t + np.pi / 2) + 1j * np.sin(2 * t + np.pi),
+    #        np.cos(t) + 1j * np.sin(t),
+    #        np.cos(t + np.pi) + 1j * np.sin(t + np.pi)])
+    #movie(roots, Region(0, 4, 800, 800), 'm00.mp4', 30, 10, 2 * np.pi, 3)
